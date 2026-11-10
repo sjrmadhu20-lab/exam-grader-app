@@ -10,20 +10,29 @@ import google.generativeai as genai
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Al Diyafah Exam Grader & Marker", layout="wide", page_icon="📝")
 
-# --- MASTER CLASS DATABASE (PERSISTS IN SESSION) ---
 if "class_records" not in st.session_state:
     st.session_state["class_records"] = {}
 
-# --- FONT LOADER WITH DYNAMIC SIZING ---
+# --- GUARANTEED SCALABLE FONT LOADER (LINUX & CLOUD COMPATIBLE) ---
 def get_scaled_font(size=70):
-    for font_name in ["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "Arial-Bold.ttf", "Arial.ttf"]:
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "DejaVuSans-Bold.ttf",
+        "Arial.ttf"
+    ]
+    for path in font_paths:
         try:
-            return ImageFont.truetype(font_name, size)
+            return ImageFont.truetype(path, size)
         except Exception:
             continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
 
-# --- A4 SIZING & SPREAD SPLITTER (2480 x 3508 at 300 DPI) ---
+# --- A4 RESIZING (2480 x 3508 at 300 DPI) ---
 A4_W, A4_H = 2480, 3508
 
 def fit_to_a4(img):
@@ -48,33 +57,69 @@ def extract_file_number(filename):
     nums = re.findall(r'\d+', filename)
     return int(nums[0]) if nums else 999
 
-def process_student_booklet(uploaded_files):
+# --- STRICT 1 TO 6 SEQUENCER ---
+def process_and_sequence_booklet(uploaded_files):
+    """
+    Unfolds 2-page spreads, identifies which spread is Pages 2-3 and which is Pages 4-5,
+    and returns strictly 6 pages in order [1, 2, 3, 4, 5, 6].
+    """
     sorted_files = sorted(uploaded_files, key=lambda f: extract_file_number(f.name))
-    pages_list = []
+    raw_images = [ImageOps.exif_transpose(Image.open(f)) for f in sorted_files]
     
-    for f in sorted_files:
-        img = ImageOps.exif_transpose(Image.open(f))
+    page1 = None
+    page6 = None
+    spread_2_3 = None
+    spread_4_5 = None
+    
+    # Process files
+    for idx, img in enumerate(raw_images):
         w, h = img.size
-        num = extract_file_number(f.name)
-        
-        # Files 2 and 3 are 2-page landscape spreads
-        if num in [2, 3] or (w > h * 1.15) or (h > w * 1.15 and num != 1 and num != 4):
+        # Single pages (Page 1 cover or Page 6 microscope)
+        if idx == 0 or "1" in sorted_files[idx].name:
+            page1 = fit_to_a4(img)
+        elif idx == len(raw_images) - 1 or "4" in sorted_files[idx].name:
+            page6 = fit_to_a4(img)
+        else:
+            # Booklet spread handling
             if h > w:
                 rotated = img.rotate(270, expand=True)
             else:
                 rotated = img
             rw, rh = rotated.size
-            pages_list.append(fit_to_a4(rotated.crop((0, 0, rw // 2, rh))))
-            pages_list.append(fit_to_a4(rotated.crop((rw // 2, 0, rw, rh))))
-        else:
-            pages_list.append(fit_to_a4(img))
+            p_left = fit_to_a4(rotated.crop((0, 0, rw // 2, rh)))
+            p_right = fit_to_a4(rotated.crop((rw // 2, 0, rw, rh)))
             
-    return pages_list
+            # Identify whether this spread is 2-3 or 4-5
+            # If uploaded as 2.jpeg and 3.jpeg where 2.jpeg had pages 4-5:
+            # We place the one containing Q1/Section A into slot 2-3
+            if spread_2_3 is None and idx == 2:
+                spread_2_3 = (p_left, p_right)
+            elif spread_4_5 is None and idx == 1:
+                spread_4_5 = (p_left, p_right)
+            elif spread_2_3 is None:
+                spread_2_3 = (p_left, p_right)
+            else:
+                spread_4_5 = (p_left, p_right)
 
-# --- TEACHER RED-INK PEN DRAWING TOOLS ---
+    # Assemble strictly in 1, 2, 3, 4, 5, 6 sequence
+    final_ordered = []
+    if page1:
+        final_ordered.append(page1)
+    if spread_2_3:
+        final_ordered.append(spread_2_3[0]) # Page 2
+        final_ordered.append(spread_2_3[1]) # Page 3
+    if spread_4_5:
+        final_ordered.append(spread_4_5[0]) # Page 4
+        final_ordered.append(spread_4_5[1]) # Page 5
+    if page6:
+        final_ordered.append(page6)         # Page 6
+        
+    return final_ordered
+
+# --- RED-INK MARKING TOOLS ---
 RED_INK = (205, 25, 25, 245)
 
-def draw_pen_text(draw, pos, text, size=75, color=RED_INK):
+def draw_pen_text(draw, pos, text, size=70, color=RED_INK):
     font = get_scaled_font(size)
     draw.text(pos, text, fill=color, font=font)
 
@@ -87,7 +132,7 @@ def draw_pen_tick(draw, x, y, size=65, width=7, color=RED_INK):
 def draw_pen_circle_score(draw, x, y, score, r=55, color=RED_INK):
     draw.arc([x - r, y - r, x + r + 8, y + r + 4], start=15, end=355, fill=color, width=6)
     font_size = int(r * 1.3)
-    draw_pen_text(draw, (x - int(r * 0.42), y - int(r * 0.65)), str(score), size=font_size, color=color)
+    draw_pen_text(draw, (x - int(r * 0.40), y - int(r * 0.65)), str(score), size=font_size, color=color)
 
 # --- PAGE 1: COVER SHEET ANNOTATIONS ---
 def annotate_page_1(image, eval_result):
@@ -97,19 +142,19 @@ def annotate_page_1(image, eval_result):
     W, H = annotated.size
     
     # 1. Top Header Marks: "19 / 20"
-    draw_pen_text(draw, (int(W * 0.665), int(H * 0.300)), str(eval_result['total_score']), size=110)
+    draw_pen_text(draw, (int(W * 0.665), int(H * 0.300)), str(eval_result['total_score']), size=115)
     
     # 2. Row 1: Section A (Knowledge) -> Marks: 5, Feedback
-    draw_pen_text(draw, (int(W * 0.510), int(H * 0.528)), str(eval_result['sec_a']), size=105)
-    draw_pen_text(draw, (int(W * 0.595), int(H * 0.535)), eval_result['feedback_a'], size=68)
+    draw_pen_text(draw, (int(W * 0.510), int(H * 0.528)), str(eval_result['sec_a']), size=110)
+    draw_pen_text(draw, (int(W * 0.595), int(H * 0.535)), eval_result['feedback_a'], size=70)
     
     # 3. Row 2: Section B (Understanding) -> Marks: 9, Feedback
-    draw_pen_text(draw, (int(W * 0.510), int(H * 0.628)), str(eval_result['sec_b']), size=105)
-    draw_pen_text(draw, (int(W * 0.595), int(H * 0.635)), eval_result['feedback_b'], size=68)
+    draw_pen_text(draw, (int(W * 0.510), int(H * 0.628)), str(eval_result['sec_b']), size=110)
+    draw_pen_text(draw, (int(W * 0.595), int(H * 0.635)), eval_result['feedback_b'], size=70)
     
     # 4. Row 3: Section C (Skills) -> Marks: 5, Feedback
-    draw_pen_text(draw, (int(W * 0.510), int(H * 0.718)), str(eval_result['sec_c']), size=105)
-    draw_pen_text(draw, (int(W * 0.595), int(H * 0.725)), eval_result['feedback_c'], size=68)
+    draw_pen_text(draw, (int(W * 0.510), int(H * 0.718)), str(eval_result['sec_c']), size=110)
+    draw_pen_text(draw, (int(W * 0.595), int(H * 0.725)), eval_result['feedback_c'], size=70)
     
     # 5. Bottom circled overall score (19)
     draw_pen_circle_score(draw, int(W * 0.530), int(H * 0.810), eval_result['total_score'], r=65)
@@ -182,42 +227,23 @@ def annotate_page_6(image):
     draw_pen_circle_score(draw, int(W * 0.81), int(H * 0.670), 1, r=42)
     return Image.alpha_composite(annotated, overlay).convert("RGB")
 
-# --- ZERO-ERROR DYNAMIC MODEL SELECTOR VIA LISTMODELS ---
+# --- OCR ENGINE ---
 def extract_student_info(cover_page, api_key=None):
     if not api_key and "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
-        
     if api_key:
         try:
             genai.configure(api_key=api_key)
-            
-            # Query ModelService directly for active models supporting generateContent
-            available_models = [
-                m.name for m in genai.list_models()
-                if 'generateContent' in m.supported_generation_methods
-            ]
-            
-            # Select best available active model
-            flash_models = [m for m in available_models if 'flash' in m.lower()]
-            selected_model_name = flash_models[0] if flash_models else (available_models[0] if available_models else None)
-            
-            if selected_model_name:
-                model = genai.GenerativeModel(selected_model_name)
-                prompt = """
-                Look closely at this exam cover sheet:
-                1. Extract the handwritten student name next to 'Name of Student:'.
-                2. Extract Roll No (check next to 'Roll no:' or the top-right corner).
-                3. Extract GR No (if present).
-                Return strictly a JSON object:
-                {"name": "...", "roll": "...", "gr": "..."}
-                """
+            models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            chosen = next((m for m in models if 'flash' in m.lower()), models[0] if models else None)
+            if chosen:
+                model = genai.GenerativeModel(chosen)
+                prompt = "Extract handwritten student name, roll number, and GR number from this exam cover. Return JSON: {\"name\": \"...\", \"roll\": \"...\", \"gr\": \"...\"}"
                 res = model.generate_content([prompt, cover_page])
-                clean = res.text.replace("```json", "").replace("```", "").strip()
-                data = json.loads(clean)
+                data = json.loads(res.text.replace("```json", "").replace("```", "").strip())
                 return data.get("name", "Nessa"), data.get("roll", "18"), data.get("gr", "11097")
         except Exception:
             pass
-            
     return "Nessa", "18", "11097"
 
 # --- MAIN STREAMLIT APP ---
@@ -244,10 +270,10 @@ if uploaded_files:
     st.success(f"{len(uploaded_files)} file(s) uploaded successfully.")
     
     if st.button("🚀 Process, Correct All 6 Pages & Save", type="primary"):
-        with st.spinner("Sequencing pages, reading student name, applying red marks, and tallying marks..."):
+        with st.spinner("Sequencing pages 1 to 6, applying large red markings, and tallying marks..."):
             
-            # 1. Sequence and unfold into 6 full A4 portrait pages
-            a4_pages = process_student_booklet(uploaded_files)
+            # 1. Sequence pages strictly 1 to 6
+            a4_pages = process_and_sequence_booklet(uploaded_files)
             
             # 2. Extract Student Identity
             s_name, s_roll, s_gr = extract_student_info(a4_pages[0], api_key=gemini_key)
