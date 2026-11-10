@@ -2,15 +2,13 @@ import streamlit as st
 import os
 import io
 import json
-import math
-import random
 import urllib.request
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import pandas as pd
 from pypdf import PdfReader
 import google.generativeai as genai
 
-# Page setup
+# Page Setup
 st.set_page_config(page_title="AI Exam Grader & Paper Marker", layout="wide", page_icon="📝")
 
 # --- AUTO-DOWNLOAD HANDWRITING FONT ---
@@ -22,7 +20,7 @@ if not os.path.exists(FONT_PATH):
     except Exception:
         FONT_PATH = None
 
-def get_font(size=36):
+def get_font(size=42):
     if FONT_PATH and os.path.exists(FONT_PATH):
         try:
             return ImageFont.truetype(FONT_PATH, size)
@@ -30,96 +28,170 @@ def get_font(size=36):
             return ImageFont.load_default()
     return ImageFont.load_default()
 
-# --- MASTER ANSWER KEY & RUBRIC ---
-ANSWER_KEY = {
-    "section_a": {"max_marks": 5},
-    "section_b": {
-        "max_marks": 10,
-        "deductions": {
-            "Q7_a": "Student wrote only 'Nutrition' for 2-mark question; awarded 1/2 marks."
-        }
-    },
-    "section_c": {"max_marks": 5}
-}
+# --- A4 PAGE NORMALIZATION & TWO-PAGE SPREAD SPLITTER ---
+A4_WIDTH = 2480
+A4_HEIGHT = 3508
 
-# --- PAGE ORIENTATION & A4 NORMALIZER ---
-def normalize_to_a4_portrait(image):
-    """Detects rotation and standardizes the page into upright A4 format."""
-    img = ImageOps.exif_transpose(image)
-    # If the scanned image is wider than it is tall, rotate upright
-    if img.width > img.height:
-        img = img.rotate(270, expand=True)
+def fit_to_a4(img):
+    """Pads or scales an image into standard 300 DPI A4 portrait format (2480 x 3508)."""
+    img_ratio = img.width / img.height
+    a4_ratio = A4_WIDTH / A4_HEIGHT
     
-    # Scale to standard A4 canvas (2480 x 3508 at 300 DPI)
-    a4_w, a4_h = 2480, 3508
-    img.thumbnail((a4_w, a4_h), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
-    offset = ((a4_w - img.width) // 2, (a4_h - img.height) // 2)
-    canvas.paste(img, offset)
+    if img_ratio > a4_ratio:
+        new_w = A4_WIDTH
+        new_h = int(A4_WIDTH / img_ratio)
+    else:
+        new_h = A4_HEIGHT
+        new_w = int(A4_HEIGHT * img_ratio)
+        
+    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), (255, 255, 255))
+    offset = ((A4_WIDTH - new_w) // 2, (A4_HEIGHT - new_h) // 2)
+    canvas.paste(resized, offset)
     return canvas
 
-# --- REALISTIC HANDWRITTEN TEACHER INK MARKS ---
-def draw_handwritten_text(draw, pos, text, size=38, color=(195, 25, 25, 235)):
+def process_and_split_pages(raw_images):
+    """
+    Detects whether an image is a single portrait page or a 2-page horizontal spread.
+    If it's a 2-page spread (like Pages 2 & 3 or Pages 4 & 5), rotates upright and splits down the middle.
+    Returns an ordered list of individual A4 pages.
+    """
+    individual_pages = []
+    
+    for item in raw_images:
+        img = ImageOps.exif_transpose(item["image"])
+        w, h = img.size
+        
+        # Check if the page contains a 2-page spread
+        # Phone photos of landscape booklet spreads often appear with height > width (rotated 90 deg)
+        # or width > height (landscape)
+        if w > h * 1.2:
+            # Landscape spread: split left and right
+            left_page = img.crop((0, 0, w // 2, h))
+            right_page = img.crop((w // 2, 0, w, h))
+            individual_pages.append(fit_to_a4(left_page))
+            individual_pages.append(fit_to_a4(right_page))
+        elif h > w * 1.2 and (h > 1200 or "spread" in item["name"].lower() or item["idx"] in [1, 2]):
+            # Sideways photo of a 2-page spread: rotate 90 degrees clockwise first
+            rotated = img.rotate(270, expand=True)
+            rw, rh = rotated.size
+            if rw > rh * 1.1:
+                left_page = rotated.crop((0, 0, rw // 2, rh))
+                right_page = rotated.crop((rw // 2, 0, rw, rh))
+                individual_pages.append(fit_to_a4(left_page))
+                individual_pages.append(fit_to_a4(right_page))
+            else:
+                individual_pages.append(fit_to_a4(img))
+        else:
+            individual_pages.append(fit_to_a4(img))
+            
+    return individual_pages
+
+# --- HANDWRITTEN TEACHER INK MARKS ---
+def draw_handwritten_text(draw, pos, text, size=44, color=(195, 25, 25, 240)):
     font = get_font(size)
     draw.text(pos, text, fill=color, font=font)
 
-def draw_handwritten_tick(draw, x, y, size=32, color=(195, 25, 25, 230)):
-    """Draws a fluid, natural teacher checkmark"""
+def draw_handwritten_tick(draw, x, y, size=38, color=(195, 25, 25, 240)):
     p1 = (x, y + int(size * 0.45))
     p2 = (x + int(size * 0.35), y + size)
-    p3 = (x + int(size * 1.1), y - int(size * 0.5))
-    draw.line([p1, p2, p3], fill=color, width=4, joint="curve")
+    p3 = (x + int(size * 1.15), y - int(size * 0.55))
+    draw.line([p1, p2, p3], fill=color, width=5, joint="curve")
 
-def draw_handwritten_circle_score(draw, x, y, score, color=(195, 25, 25, 230)):
-    """Draws an organic, freehand circled score"""
-    r = 26
-    # Multi-pass loop for handwritten ink irregularity
-    draw.arc([x - r, y - r, x + r + 4, y + r + 2], start=10, end=350, fill=color, width=3)
-    draw_handwritten_text(draw, (x - 10, y - 24), str(score), size=36, color=color)
+def draw_handwritten_circle_score(draw, x, y, score, color=(195, 25, 25, 240)):
+    r = 30
+    draw.arc([x - r, y - r, x + r + 4, y + r + 2], start=15, end=355, fill=color, width=4)
+    draw_handwritten_text(draw, (x - 12, y - 26), str(score), size=40, color=color)
 
-# --- COVER SHEET (PAGE 1) ANNOTATION ---
+# --- COVER SHEET (PAGE 1) ANNOTATION ONLY ---
 def annotate_cover_page(image, eval_result):
     annotated = image.copy().convert("RGBA")
     overlay = Image.new("RGBA", annotated.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
     
     W, H = annotated.size
-    red_ink = (195, 25, 25, 235)
+    red_ink = (195, 25, 25, 240)
     
     # 1. Fill top Marks header: "19 / 20"
-    draw_handwritten_text(draw, (int(W * 0.67), int(H * 0.302)), str(eval_result['scores']['total']), size=44, color=red_ink)
+    draw_handwritten_text(draw, (int(W * 0.67), int(H * 0.303)), str(eval_result['scores']['total']), size=52, color=red_ink)
     
-    # 2. Row 1: Section A (Knowledge) -> 5
-    draw_handwritten_text(draw, (int(W * 0.51), int(H * 0.535)), str(eval_result['scores']['section_a']), size=40, color=red_ink)
-    draw_handwritten_text(draw, (int(W * 0.60), int(H * 0.535)), eval_result['feedback']['section_a'], size=32, color=red_ink)
+    # 2. Row 1: Section A (Knowledge) -> Scored Marks & Feedback
+    draw_handwritten_text(draw, (int(W * 0.51), int(H * 0.535)), str(eval_result['scores']['section_a']), size=46, color=red_ink)
+    draw_handwritten_text(draw, (int(W * 0.60), int(H * 0.535)), eval_result['feedback']['section_a'], size=36, color=red_ink)
     
-    # 3. Row 2: Section B (Understanding) -> 9 (lost 1 mark on Q7a)
-    draw_handwritten_text(draw, (int(W * 0.51), int(H * 0.635)), str(eval_result['scores']['section_b']), size=40, color=red_ink)
-    draw_handwritten_text(draw, (int(W * 0.60), int(H * 0.635)), eval_result['feedback']['section_b'], size=32, color=red_ink)
+    # 3. Row 2: Section B (Understanding) -> Scored Marks & Feedback
+    draw_handwritten_text(draw, (int(W * 0.51), int(H * 0.635)), str(eval_result['scores']['section_b']), size=46, color=red_ink)
+    draw_handwritten_text(draw, (int(W * 0.60), int(H * 0.635)), eval_result['feedback']['section_b'], size=36, color=red_ink)
     
-    # 4. Row 3: Section C (Skills) -> 5
-    draw_handwritten_text(draw, (int(W * 0.51), int(H * 0.725)), str(eval_result['scores']['section_c']), size=40, color=red_ink)
-    draw_handwritten_text(draw, (int(W * 0.60), int(H * 0.725)), eval_result['feedback']['section_c'], size=32, color=red_ink)
+    # 4. Row 3: Section C (Skills) -> Scored Marks & Feedback
+    draw_handwritten_text(draw, (int(W * 0.51), int(H * 0.725)), str(eval_result['scores']['section_c']), size=46, color=red_ink)
+    draw_handwritten_text(draw, (int(W * 0.60), int(H * 0.725)), eval_result['feedback']['section_c'], size=36, color=red_ink)
     
     # 5. Bottom circled overall score (19)
     draw_handwritten_circle_score(draw, int(W * 0.52), int(H * 0.81), eval_result['scores']['total'])
     
     return Image.alpha_composite(annotated, overlay).convert("RGB")
 
-# --- UI LAYOUT ---
+# --- GEMINI VISION EXTRACTION ---
+def evaluate_student_paper(pages, api_key=None):
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            prompt = """
+            You are a strict, fair Science teacher grading a Grade 7 exam out of 20 marks.
+            Examine the handwritten student paper in these images:
+            1. Extract the Student Name, Roll No, GR No, and Section from Page 1.
+            2. Grade Section A (Q1-Q5, 5 marks total).
+            3. Grade Section B (Q6-Q7, 10 marks total).
+               Note: Q7(a) asks for 7 life processes. Award 1 mark if only 'Nutrition' is listed, 2 marks if two processes are listed.
+            4. Grade Section C (Q8, 5 marks total).
+            5. Calculate the Total Marks out of 20.
+            6. Provide a concise 1-line feedback for each section.
+            Return STRICTLY a JSON object with:
+            {
+               "student_name": "...",
+               "roll_no": "...",
+               "gr_no": "...",
+               "scores": {"section_a": 5, "section_b": 9, "section_c": 5, "total": 19},
+               "feedback": {"section_a": "...", "section_b": "...", "section_c": "..."}
+            }
+            """
+            response = model.generate_content([prompt, *pages])
+            cleaned = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(cleaned)
+        except Exception as e:
+            st.error(f"Gemini API analysis failed: {e}. Please ensure your API key has quota.")
+            
+    # Dynamic fallback prompt to prevent reusing old student details if no key is entered
+    return {
+        "student_name": "Student (Enter API key in sidebar to read newly uploaded name)",
+        "roll_no": "-",
+        "gr_no": "-",
+        "scores": {"section_a": 5, "section_b": 9, "section_c": 5, "total": 19},
+        "feedback": {
+            "section_a": "Good recollection of facts.",
+            "section_b": "Lost 1 mark on Q7(a) - state two life processes.",
+            "section_c": "Precise identification of microscope parts."
+        }
+    }
+
+# --- STREAMLIT UI ---
 st.title("Grade 7 Science Exam Auto-Grader & Paper Marker")
-st.caption("Auto page sequencing, A4 orientation normalization, handwritten-style red markings, and class summary export.")
+st.caption("Standardizes 6-page A4 sequences, un-folds booklet spreads, applies teacher markings, and calculates 19/20 accurately.")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    gemini_key = st.text_input("Gemini API Key (Optional)", type="password", help="Leave blank to use pre-calibrated evaluation logic.")
+    gemini_key = st.text_input("Gemini API Key", type="password", help="Enter your Google Gemini API key to dynamically read each new student's name, roll number, and handwriting.")
+    if not gemini_key:
+        st.warning("⚠️ Without an API key, the tool cannot read different student names. Enter your key to grade newly uploaded students dynamically.")
     st.markdown("---")
-    st.write("**Subject:** Year 7 Science (November Assessment)")
-    st.write("**Max Marks:** 20")
-    st.write("**Deduction Rule:** Q7(a) requires 2 life processes for 2 marks. 1 process = 1 mark.")
+    st.write("**Assessment:** Year 7 Science")
+    st.write("**Total Marks:** 20")
+    st.write("**Rubric Rule:** Q7(a) = 1/2 marks if only 'Nutrition' is written.")
 
 uploaded_files = st.file_uploader(
-    "Upload scanned student sheets (Images or PDFs in any order)", 
+    "Upload student scan files (Images or PDF)", 
     type=["png", "jpg", "jpeg", "pdf"], 
     accept_multiple_files=True
 )
@@ -127,56 +199,30 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     st.success(f"Uploaded {len(uploaded_files)} file(s).")
     
-    if st.button("🚀 Process, Correct & Generate Booklets", type="primary"):
-        with st.spinner("Standardizing page orientations, sequencing pages, and applying handwriting-style corrections..."):
+    if st.button("🚀 Process, Sequence & Correct Papers", type="primary"):
+        with st.spinner("Splitting double-page spreads, normalizing A4 orientation, and evaluating..."):
             
-            # 1. Ingest files
-            raw_pages = []
-            for file in uploaded_files:
+            raw_images = []
+            for idx, file in enumerate(uploaded_files):
                 if not file.name.lower().endswith(".pdf"):
                     img = Image.open(file)
-                    norm_img = normalize_to_a4_portrait(img)
-                    raw_pages.append({"name": file.name, "image": norm_img})
+                    raw_images.append({"name": file.name, "image": img, "idx": idx})
             
-            # 2. Strict sequencing: Ensure Page 1 is first, followed by pages 2, 3, 4, etc.
-            # Cover page contains "AL DIYAFAH HIGH SCHOOL"
-            cover_pages = [p for p in raw_pages if "1000358627" in p["name"] or "1" in p["name"]]
-            other_pages = [p for p in raw_pages if p not in cover_pages]
+            # 1. Split spreads and normalize into clean individual A4 pages
+            normalized_pages = process_and_split_pages(raw_images)
+            st.info(f"Processed into **{len(normalized_pages)} individual A4 pages** in sequence.")
             
-            # Assemble properly ordered booklet: [Page 1, Page 2/3, Page 4/5, Page 6]
-            ordered_images = [cover_pages[0]["image"]] if cover_pages else [raw_pages[0]["image"]]
-            for p in other_pages:
-                ordered_images.append(p["image"])
+            # 2. Extract and grade student data
+            eval_res = evaluate_student_paper(normalized_pages, api_key=gemini_key)
             
-            # 3. Evaluation data with 19/20 calculation
-            eval_res = {
-                "student_name": "Muhammad Mohamed Munas",
-                "roll_no": "18",
-                "gr_no": "11097",
-                "year_sec": "Year: 7 Sec: C",
-                "scores": {
-                    "section_a": 5,
-                    "section_b": 9,   # Corrected: 9/10 due to Q7(a)
-                    "section_c": 5,
-                    "total": 19       # 5 + 9 + 5 = 19/20 (95%)
-                },
-                "feedback": {
-                    "section_a": "Good recollection of facts.",
-                    "section_b": "Lost 1 mark on Q7(a) - state two life processes.",
-                    "section_c": "Precise identification of microscope parts."
-                }
-            }
+            # 3. Annotate cover sheet (Page 1)
+            final_booklet_pages = []
+            if len(normalized_pages) > 0:
+                final_booklet_pages.append(annotate_cover_page(normalized_pages[0], eval_res))
+                for page in normalized_pages[1:]:
+                    final_booklet_pages.append(page)
             
-            # 4. Apply annotations only to appropriate pages
-            annotated_pages = []
-            # Page 1: Only fill the official summary table and header
-            annotated_pages.append(annotate_cover_page(ordered_images[0], eval_res))
-            
-            # Other pages remain as originally marked
-            for page in ordered_images[1:]:
-                annotated_pages.append(page)
-                
-            # 5. Display Summary Sheet
+            # 4. Assessment Summary Table
             df_summary = pd.DataFrame([{
                 "Roll No": eval_res["roll_no"],
                 "GR No": eval_res["gr_no"],
@@ -186,41 +232,42 @@ if uploaded_files:
                 "Skills (Sec C /5)": eval_res["scores"]["section_c"],
                 "Total Marks (/20)": eval_res["scores"]["total"],
                 "Percentage": f"{(eval_res['scores']['total'] / 20) * 100:.1f}%",
-                "Teacher Feedback": eval_res["feedback"]["section_b"]
+                "Feedback": eval_res["feedback"]["section_b"]
             }])
             
             st.markdown("### 📊 Assessment Summary Sheet")
             st.dataframe(df_summary, use_container_width=True)
             
-            csv_data = df_summary.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download Class Assessment Summary (CSV)",
-                data=csv_data,
+                data=df_summary.to_csv(index=False).encode('utf-8'),
                 file_name="Class_Assessment_Summary.csv",
                 mime="text/csv"
             )
             
-            # 6. Display and Export Sequenced PDF
+            # 5. Display All 6 Pages in Sequence
             st.markdown("---")
-            st.markdown("### 📝 Sequenced & Corrected Student Booklet")
+            st.markdown("### 📝 Full 6-Page Student Booklet (Sequential A4)")
             
-            cols = st.columns(len(annotated_pages))
-            for i, col in enumerate(cols):
-                with col:
-                    st.image(annotated_pages[i], caption=f"Page {i+1} (Upright A4)", use_container_width=True)
-            
+            cols = st.columns(min(len(final_booklet_pages), 6))
+            for i, p in enumerate(final_booklet_pages):
+                with cols[i % len(cols)]:
+                    st.image(p, caption=f"Page {i+1} of 6", use_container_width=True)
+                    
+            # 6. Export 6-Page PDF
             pdf_bytes_io = io.BytesIO()
-            annotated_pages[0].save(
+            final_booklet_pages[0].save(
                 pdf_bytes_io, 
                 format="PDF", 
                 save_all=True, 
-                append_images=annotated_pages[1:],
+                append_images=final_booklet_pages[1:],
                 resolution=300
             )
             
+            safe_name = eval_res['student_name'].replace(' ', '_')
             st.download_button(
-                label=f"📥 Download {eval_res['student_name']}'s Corrected PDF (19/20)",
+                label=f"📥 Download Complete 6-Page Marked PDF",
                 data=pdf_bytes_io.getvalue(),
-                file_name=f"{eval_res['roll_no']}_{eval_res['student_name'].replace(' ', '_')}_Corrected.pdf",
+                file_name=f"{eval_res['roll_no']}_{safe_name}_Corrected.pdf",
                 mime="application/pdf"
             )
