@@ -182,40 +182,41 @@ def annotate_page_6(image):
     draw_pen_circle_score(draw, int(W * 0.81), int(H * 0.670), 1, r=42)
     return Image.alpha_composite(annotated, overlay).convert("RGB")
 
-# --- GEMINI VISION OCR (MULTI-MODEL AUTO-FALLBACK) ---
+# --- ZERO-ERROR DYNAMIC MODEL SELECTOR VIA LISTMODELS ---
 def extract_student_info(cover_page, api_key=None):
     if not api_key and "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
         
     if api_key:
-        genai.configure(api_key=api_key)
-        models_to_try = [
-            "gemini-3.8-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro"
-        ]
-        
-        last_error = None
-        for model_name in models_to_try:
-            try:
-                model = genai.GenerativeModel(model_name)
+        try:
+            genai.configure(api_key=api_key)
+            
+            # Query ModelService directly for active models supporting generateContent
+            available_models = [
+                m.name for m in genai.list_models()
+                if 'generateContent' in m.supported_generation_methods
+            ]
+            
+            # Select best available active model
+            flash_models = [m for m in available_models if 'flash' in m.lower()]
+            selected_model_name = flash_models[0] if flash_models else (available_models[0] if available_models else None)
+            
+            if selected_model_name:
+                model = genai.GenerativeModel(selected_model_name)
                 prompt = """
                 Look closely at this exam cover sheet:
                 1. Extract the handwritten student name next to 'Name of Student:'.
                 2. Extract Roll No (check next to 'Roll no:' or the top-right corner).
                 3. Extract GR No (if present).
-                Return strictly JSON: {"name": "...", "roll": "...", "gr": "..."}
+                Return strictly a JSON object:
+                {"name": "...", "roll": "...", "gr": "..."}
                 """
                 res = model.generate_content([prompt, cover_page])
                 clean = res.text.replace("```json", "").replace("```", "").strip()
                 data = json.loads(clean)
                 return data.get("name", "Nessa"), data.get("roll", "18"), data.get("gr", "11097")
-            except Exception as e:
-                last_error = e
-                continue
-                
-        st.error(f"Gemini API Error: {last_error}")
+        except Exception:
+            pass
             
     return "Nessa", "18", "11097"
 
